@@ -1,0 +1,424 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Enable CloudWatch Logs for Amazon Connect AI Agents - Automated Setup'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Amazon Connect AI Agent Configuration"
+        Parameters:
+          - AssistantArn
+          - DeliverySourceName
+      - Label:
+          default: "CloudWatch Logs Configuration"
+        Parameters:
+          - LogGroupName
+          - LogRetentionDays
+          - OutputFormat
+      - Label:
+          default: "Tagging"
+        Parameters:
+          - Environment
+          - CostCenter
+    ParameterLabels:
+      AssistantArn:
+        default: "Assistant ARN"
+      DeliverySourceName:
+        default: "Delivery Source Name"
+      LogGroupName:
+        default: "CloudWatch Log Group Name"
+      LogRetentionDays:
+        default: "Log Retention Period (Days)"
+      OutputFormat:
+        default: "Log Output Format"
+
+Parameters:
+  AssistantArn:
+    Type: String
+    Description: >
+      The ARN of your Amazon Connect Assistant (also known as domain).
+      Format: arn:aws:wisdom:region:account-id:assistant/assistant-id
+      You can find this in the Amazon Connect console or by calling GetAssistant API.
+    AllowedPattern: '^arn:aws:wisdom:[a-z0-9-]+:[0-9]{12}:assistant/[a-f0-9-]+$'
+    ConstraintDescription: Must be a valid Amazon Connect Assistant ARN
+
+  DeliverySourceName:
+    Type: String
+    Description: Name for the CloudWatch Logs delivery source
+    Default: connect-ai-agent-delivery-source
+    MinLength: 1
+    MaxLength: 60
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  LogGroupName:
+    Type: String
+    Description: Name for the CloudWatch Log Group where AI Agent logs will be stored
+    Default: /aws/connect/ai-agents
+    MinLength: 1
+    MaxLength: 512
+    AllowedPattern: '^[\.\-_/#A-Za-z0-9]+$'
+    ConstraintDescription: Must be a valid CloudWatch Log Group name
+
+  LogRetentionDays:
+    Type: Number
+    Description: Number of days to retain logs in CloudWatch
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1096
+      - 1827
+      - 2192
+      - 2557
+      - 2922
+      - 3288
+      - 3653
+
+  OutputFormat:
+    Type: String
+    Description: Format for the log output
+    Default: json
+    AllowedValues:
+      - json
+      - plain
+      - w3c
+      - raw
+      - parquet
+
+  Environment:
+    Type: String
+    Description: Environment tag (e.g., Production, Development, Test)
+    Default: Production
+    AllowedValues:
+      - Production
+      - Development
+      - Test
+      - Staging
+
+  CostCenter:
+    Type: String
+    Description: Cost center or team name for billing purposes
+    Default: ContactCenter
+
+Resources:
+  # CloudWatch Log Group for AI Agent logs
+  AIAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Ref LogGroupName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Amazon Connect AI Agent Logging
+
+  # IAM Role for CloudWatch Logs Delivery
+  LogsDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DeliverySourceName}-delivery-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DeliverySourceName}-delivery-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Resource Policy for CloudWatch Logs to allow Amazon Connect AI Agents to write logs
+  LogGroupResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${DeliverySourceName}-resource-policy'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowWisdomToDeliverLogs",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "wisdom.amazonaws.com"
+              },
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": "${AIAgentLogGroup.Arn}:*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": "${AWS::AccountId}"
+                },
+                "ArnLike": {
+                  "aws:SourceArn": "${AssistantArn}"
+                }
+              }
+            }
+          ]
+        }
+
+  # Custom Resource to call CloudWatch Logs Delivery APIs
+  DeliverySetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${DeliverySourceName}-setup'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DeliverySetupFunctionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          LOG_GROUP_ARN: !GetAtt AIAgentLogGroup.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import time
+          
+          logs_client = boto3.client('logs')
+          
+          def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              
+              response_data = {}
+              physical_resource_id = event.get('PhysicalResourceId', 'AIAgentLogsDelivery')
+              
+              try:
+                  request_type = event['RequestType']
+                  properties = event['ResourceProperties']
+                  
+                  assistant_arn = properties['AssistantArn']
+                  delivery_source_name = properties['DeliverySourceName']
+                  log_group_arn = properties['LogGroupArn']
+                  output_format = properties['OutputFormat']
+                  delivery_destination_name = f"{delivery_source_name}-destination"
+                  
+                  if request_type == 'Create':
+                      print("Creating delivery source, destination, and delivery...")
+                      
+                      # Step 1: Create Delivery Source
+                      print(f"Creating delivery source: {delivery_source_name}")
+                      source_response = logs_client.put_delivery_source(
+                          name=delivery_source_name,
+                          resourceArn=assistant_arn,
+                          logType='EVENT_LOGS'
+                      )
+                      delivery_source_arn = source_response['deliverySource']['arn']
+                      print(f"Delivery source created: {delivery_source_arn}")
+                      
+                      # Wait a bit for the source to be ready
+                      time.sleep(2)
+                      
+                      # Step 2: Create Delivery Destination
+                      print(f"Creating delivery destination: {delivery_destination_name}")
+                      destination_response = logs_client.put_delivery_destination(
+                          name=delivery_destination_name,
+                          outputFormat=output_format,
+                          deliveryDestinationConfiguration={
+                              'destinationResourceArn': log_group_arn
+                          }
+                      )
+                      delivery_destination_arn = destination_response['deliveryDestination']['arn']
+                      print(f"Delivery destination created: {delivery_destination_arn}")
+                      
+                      # Wait a bit for the destination to be ready
+                      time.sleep(2)
+                      
+                      # Step 3: Create Delivery (link source to destination)
+                      print("Creating delivery to link source and destination...")
+                      delivery_response = logs_client.create_delivery(
+                          deliverySourceName=delivery_source_name,
+                          deliveryDestinationArn=delivery_destination_arn
+                      )
+                      delivery_id = delivery_response['delivery']['id']
+                      print(f"Delivery created: {delivery_id}")
+                      
+                      response_data['DeliverySourceArn'] = delivery_source_arn
+                      response_data['DeliveryDestinationArn'] = delivery_destination_arn
+                      response_data['DeliveryId'] = delivery_id
+                      response_data['Status'] = 'SUCCESS'
+                      
+                      physical_resource_id = delivery_id
+                      
+                  elif request_type == 'Update':
+                      print("Update not supported - will recreate resources")
+                      response_data['Status'] = 'UPDATE_NOT_SUPPORTED'
+                      
+                  elif request_type == 'Delete':
+                      print("Deleting delivery, destination, and source...")
+                      
+                      try:
+                          # Try to delete delivery first
+                          deliveries = logs_client.describe_deliveries(limit=100)
+                          for delivery in deliveries.get('deliveries', []):
+                              if delivery_source_name in delivery.get('deliverySourceName', ''):
+                                  print(f"Deleting delivery: {delivery['id']}")
+                                  logs_client.delete_delivery(id=delivery['id'])
+                                  time.sleep(2)
+                      except Exception as e:
+                          print(f"Error deleting delivery: {str(e)}")
+                      
+                      try:
+                          # Delete destination
+                          print(f"Deleting delivery destination: {delivery_destination_name}")
+                          logs_client.delete_delivery_destination(name=delivery_destination_name)
+                          time.sleep(2)
+                      except Exception as e:
+                          print(f"Error deleting destination: {str(e)}")
+                      
+                      try:
+                          # Delete source
+                          print(f"Deleting delivery source: {delivery_source_name}")
+                          logs_client.delete_delivery_source(name=delivery_source_name)
+                      except Exception as e:
+                          print(f"Error deleting source: {str(e)}")
+                      
+                      response_data['Status'] = 'DELETED'
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  response_data['Error'] = str(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data, physical_resource_id)
+      Tags:
+        - Key: Name
+          Value: !Sub '${DeliverySourceName}-setup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  DeliverySetupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DeliverySourceName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CloudWatchLogsDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:PutDeliverySource'
+                  - 'logs:GetDeliverySource'
+                  - 'logs:DeleteDeliverySource'
+                  - 'logs:PutDeliveryDestination'
+                  - 'logs:GetDeliveryDestination'
+                  - 'logs:DeleteDeliveryDestination'
+                  - 'logs:CreateDelivery'
+                  - 'logs:GetDelivery'
+                  - 'logs:DeleteDelivery'
+                  - 'logs:DescribeDeliveries'
+                  - 'logs:DescribeDeliveryDestinations'
+                  - 'logs:DescribeDeliverySources'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: !GetAtt LogsDeliveryRole.Arn
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'logs.amazonaws.com'
+              - Effect: Allow
+                Action:
+                  - 'wisdom:AllowVendedLogDeliveryForResource'
+                Resource: !Ref AssistantArn
+      Tags:
+        - Key: Name
+          Value: !Sub '${DeliverySourceName}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Custom Resource to invoke the Lambda function
+  DeliverySetup:
+    Type: Custom::DeliverySetup
+    DependsOn:
+      - AIAgentLogGroup
+      - LogGroupResourcePolicy
+    Properties:
+      ServiceToken: !GetAtt DeliverySetupFunction.Arn
+      AssistantArn: !Ref AssistantArn
+      DeliverySourceName: !Ref DeliverySourceName
+      LogGroupArn: !GetAtt AIAgentLogGroup.Arn
+      OutputFormat: !Ref OutputFormat
+
+Outputs:
+  LogGroupName:
+    Description: CloudWatch Log Group name for AI Agent logs
+    Value: !Ref LogGroupName
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  LogGroupArn:
+    Description: CloudWatch Log Group ARN
+    Value: !GetAtt AIAgentLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupArn'
+
+  DeliverySourceArn:
+    Description: CloudWatch Logs Delivery Source ARN
+    Value: !GetAtt DeliverySetup.DeliverySourceArn
+
+  DeliveryDestinationArn:
+    Description: CloudWatch Logs Delivery Destination ARN
+    Value: !GetAtt DeliverySetup.DeliveryDestinationArn
+
+  DeliveryId:
+    Description: CloudWatch Logs Delivery ID
+    Value: !GetAtt DeliverySetup.DeliveryId
+
+  ConsoleUrl:
+    Description: Direct link to view logs in CloudWatch console
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${LogGroupName}'
+
+  SetupStatus:
+    Description: Setup completion status
+    Value: !GetAtt DeliverySetup.Status
+
+  NextSteps:
+    Description: What to do next
+    Value: >
+      CloudWatch Logs for AI Agents is now enabled! 
+      Logs will appear in the log group after AI Agent interactions occur.
+      Use CloudWatch Logs Insights to query and analyze the logs.
