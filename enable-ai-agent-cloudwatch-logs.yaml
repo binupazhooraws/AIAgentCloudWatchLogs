@@ -153,7 +153,8 @@ Resources:
         - Key: CostCenter
           Value: !Ref CostCenter
 
-  # Resource Policy for CloudWatch Logs to allow Amazon Connect AI Agents to write logs
+  # Resource Policy for CloudWatch Logs — allows BOTH the wisdom service
+  # AND the vended log delivery service to write to the log group
   LogGroupResourcePolicy:
     Type: AWS::Logs::ResourcePolicy
     Properties:
@@ -179,6 +180,39 @@ Resources:
                 },
                 "ArnLike": {
                   "aws:SourceArn": "${AssistantArn}"
+                }
+              }
+            },
+            {
+              "Sid": "AllowVendedLogDeliveryToLogGroup",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "delivery.logs.amazonaws.com"
+              },
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": "${AIAgentLogGroup.Arn}:*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": "${AWS::AccountId}"
+                }
+              }
+            },
+            {
+              "Sid": "AllowVendedLogDeliveryDescribe",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "delivery.logs.amazonaws.com"
+              },
+              "Action": [
+                "logs:DescribeLogGroups"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": "${AWS::AccountId}"
                 }
               }
             }
@@ -235,8 +269,8 @@ Resources:
                       delivery_source_arn = source_response['deliverySource']['arn']
                       print(f"Delivery source created: {delivery_source_arn}")
                       
-                      # Wait a bit for the source to be ready
-                      time.sleep(2)
+                      # Wait for the source to be ready
+                      time.sleep(5)
                       
                       # Step 2: Create Delivery Destination
                       print(f"Creating delivery destination: {delivery_destination_name}")
@@ -250,8 +284,8 @@ Resources:
                       delivery_destination_arn = destination_response['deliveryDestination']['arn']
                       print(f"Delivery destination created: {delivery_destination_arn}")
                       
-                      # Wait a bit for the destination to be ready
-                      time.sleep(2)
+                      # Wait for the destination to be ready and resource policy to propagate
+                      time.sleep(30)
                       
                       # Step 3: Create Delivery (link source to destination)
                       print("Creating delivery to link source and destination...")
@@ -280,27 +314,24 @@ Resources:
                           # Try to delete delivery first
                           deliveries = logs_client.describe_deliveries(limit=100)
                           for delivery in deliveries.get('deliveries', []):
-                              if delivery_source_name in delivery.get('deliverySourceName', ''):
-                                  print(f"Deleting delivery: {delivery['id']}")
+                              if delivery.get('deliverySourceName') == delivery_source_name:
                                   logs_client.delete_delivery(id=delivery['id'])
+                                  print(f"Deleted delivery: {delivery['id']}")
                                   time.sleep(2)
                       except Exception as e:
-                          print(f"Error deleting delivery: {str(e)}")
+                          print(f"Error deleting delivery: {e}")
                       
                       try:
-                          # Delete destination
-                          print(f"Deleting delivery destination: {delivery_destination_name}")
                           logs_client.delete_delivery_destination(name=delivery_destination_name)
-                          time.sleep(2)
+                          print(f"Deleted delivery destination: {delivery_destination_name}")
                       except Exception as e:
-                          print(f"Error deleting destination: {str(e)}")
+                          print(f"Error deleting destination: {e}")
                       
                       try:
-                          # Delete source
-                          print(f"Deleting delivery source: {delivery_source_name}")
                           logs_client.delete_delivery_source(name=delivery_source_name)
+                          print(f"Deleted delivery source: {delivery_source_name}")
                       except Exception as e:
-                          print(f"Error deleting source: {str(e)}")
+                          print(f"Error deleting source: {e}")
                       
                       response_data['Status'] = 'DELETED'
                   
@@ -318,6 +349,7 @@ Resources:
         - Key: CostCenter
           Value: !Ref CostCenter
 
+  # IAM Role for the Lambda function
   DeliverySetupFunctionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -329,39 +361,39 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: 'sts:AssumeRole'
-      ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
       Policies:
-        - PolicyName: CloudWatchLogsDeliveryPolicy
+        - PolicyName: !Sub '${DeliverySourceName}-lambda-policy'
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # CloudWatch Logs permissions for the Lambda itself
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              # CloudWatch Logs Delivery API permissions
               - Effect: Allow
                 Action:
                   - 'logs:PutDeliverySource'
-                  - 'logs:GetDeliverySource'
-                  - 'logs:DeleteDeliverySource'
                   - 'logs:PutDeliveryDestination'
-                  - 'logs:GetDeliveryDestination'
-                  - 'logs:DeleteDeliveryDestination'
                   - 'logs:CreateDelivery'
                   - 'logs:GetDelivery'
-                  - 'logs:DeleteDelivery'
+                  - 'logs:GetDeliverySource'
+                  - 'logs:GetDeliveryDestination'
                   - 'logs:DescribeDeliveries'
-                  - 'logs:DescribeDeliveryDestinations'
                   - 'logs:DescribeDeliverySources'
+                  - 'logs:DescribeDeliveryDestinations'
+                  - 'logs:DeleteDelivery'
+                  - 'logs:DeleteDeliverySource'
+                  - 'logs:DeleteDeliveryDestination'
                 Resource: '*'
-              - Effect: Allow
-                Action:
-                  - 'iam:PassRole'
-                Resource: !GetAtt LogsDeliveryRole.Arn
-                Condition:
-                  StringEquals:
-                    'iam:PassedToService': 'logs.amazonaws.com'
+              # Wisdom permission for vended log delivery authorization
               - Effect: Allow
                 Action:
                   - 'wisdom:AllowVendedLogDeliveryForResource'
-                Resource: !Ref AssistantArn
+                Resource: '*'
       Tags:
         - Key: Name
           Value: !Sub '${DeliverySourceName}-lambda-role'
@@ -370,12 +402,13 @@ Resources:
         - Key: CostCenter
           Value: !Ref CostCenter
 
-  # Custom Resource to invoke the Lambda function
+  # Custom Resource that triggers the Lambda
   DeliverySetup:
     Type: Custom::DeliverySetup
     DependsOn:
       - AIAgentLogGroup
       - LogGroupResourcePolicy
+      - DeliverySetupFunction
     Properties:
       ServiceToken: !GetAtt DeliverySetupFunction.Arn
       AssistantArn: !Ref AssistantArn
@@ -384,41 +417,30 @@ Resources:
       OutputFormat: !Ref OutputFormat
 
 Outputs:
-  LogGroupName:
-    Description: CloudWatch Log Group name for AI Agent logs
-    Value: !Ref LogGroupName
-    Export:
-      Name: !Sub '${AWS::StackName}-LogGroupName'
-
   LogGroupArn:
-    Description: CloudWatch Log Group ARN
+    Description: ARN of the CloudWatch Log Group receiving AI Agent logs
     Value: !GetAtt AIAgentLogGroup.Arn
     Export:
       Name: !Sub '${AWS::StackName}-LogGroupArn'
 
+  LogGroupName:
+    Description: Name of the CloudWatch Log Group
+    Value: !Ref LogGroupName
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  DeliveryId:
+    Description: ID of the CloudWatch Logs delivery
+    Value: !GetAtt DeliverySetup.DeliveryId
+
   DeliverySourceArn:
-    Description: CloudWatch Logs Delivery Source ARN
+    Description: ARN of the delivery source
     Value: !GetAtt DeliverySetup.DeliverySourceArn
 
   DeliveryDestinationArn:
-    Description: CloudWatch Logs Delivery Destination ARN
+    Description: ARN of the delivery destination
     Value: !GetAtt DeliverySetup.DeliveryDestinationArn
 
-  DeliveryId:
-    Description: CloudWatch Logs Delivery ID
-    Value: !GetAtt DeliverySetup.DeliveryId
-
   ConsoleUrl:
-    Description: Direct link to view logs in CloudWatch console
-    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${LogGroupName}'
-
-  SetupStatus:
-    Description: Setup completion status
-    Value: !GetAtt DeliverySetup.Status
-
-  NextSteps:
-    Description: What to do next
-    Value: >
-      CloudWatch Logs for AI Agents is now enabled! 
-      Logs will appear in the log group after AI Agent interactions occur.
-      Use CloudWatch Logs Insights to query and analyze the logs.
+    Description: CloudWatch Logs console URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${LogGroupName}'
